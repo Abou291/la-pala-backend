@@ -1,26 +1,117 @@
-const express = require("express");
-const cors = require("cors");
-const helmet = require("helmet");
-const bcrypt = require("bcrypt");
-const jwt = require("jsonwebtoken");
-const pool = require("./db");
+/* =========================================================
+   LA PALA — server.js
+   Backend Express sécurisé (Render + PostgreSQL + Stripe)
+   ========================================================= */
 
 require("dotenv").config({
   path: __dirname + "/.env"
 });
 
+const express = require("express");
+const cors = require("cors");
+const helmet = require("helmet");
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+const rateLimit = require("express-rate-limit");
 const Stripe = require("stripe");
 
-console.log(
-  "STRIPE KEY START:",
-  process.env.STRIPE_SECRET_KEY?.substring(0, 15)
-);
+const pool = require("./db");
+
+/* =========================================================
+   1. VÉRIFICATION DES VARIABLES D'ENVIRONNEMENT
+   ========================================================= */
+
+const REQUIRED_ENV = [
+  "DATABASE_URL",
+  "JWT_SECRET",
+  "STRIPE_SECRET_KEY",
+  "STRIPE_WEBHOOK_SECRET",
+  "FRONTEND_URL"
+];
+
+const missingEnv = REQUIRED_ENV.filter(key => !process.env[key]);
+
+if (missingEnv.length > 0) {
+  throw new Error(
+    "Variables d'environnement manquantes : " +
+    missingEnv.join(", ") +
+    ". Le serveur ne peut pas démarrer."
+  );
+}
+
+const FRONTEND_URL = process.env.FRONTEND_URL.replace(/\/+$/, "");
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 
-/* Webhook Stripe : doit être AVANT express.json() */
+// Render tourne derrière un proxy : nécessaire pour le rate-limit et l'IP réelle.
+app.set("trust proxy", 1);
+
+/* =========================================================
+   DÉTECTION DU SCHÉMA
+   Permet d'utiliser les colonnes/tables optionnelles
+   seulement si elles existent réellement en base.
+   ========================================================= */
+
+const SCHEMA = {
+  plats: {
+    archive: false,
+    disponible: false,
+    ordre: false,
+    allergenes: false
+  },
+  commandes: {
+    sous_total: false,
+    frais_livraison: false,
+    stripe_session_id: false,
+    stripe_payment_intent: false
+  },
+  restaurant_settings: false,
+  stripe_events: false
+};
+
+async function detectSchema() {
+  try {
+    const cols = await pool.query(`
+      SELECT table_name, column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name IN ('plats', 'commandes')
+    `);
+
+    cols.rows.forEach(({ table_name, column_name }) => {
+      if (SCHEMA[table_name] && column_name in SCHEMA[table_name]) {
+        SCHEMA[table_name][column_name] = true;
+      }
+    });
+
+    const tables = await pool.query(`
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
+        AND table_name IN ('restaurant_settings', 'stripe_events')
+    `);
+
+    tables.rows.forEach(({ table_name }) => {
+      SCHEMA[table_name] = true;
+    });
+
+    console.log("Schéma détecté :", JSON.stringify(SCHEMA));
+
+  } catch (err) {
+    console.error(
+      "Détection du schéma impossible, mode minimal activé :",
+      err.message
+    );
+  }
+}
+
+/* =========================================================
+   8. WEBHOOK STRIPE
+   Doit être déclaré AVANT express.json() (corps brut requis)
+   ========================================================= */
+
 app.post(
   "/api/stripe-webhook",
   express.raw({ type: "application/json" }),
@@ -36,23 +127,91 @@ app.post(
         process.env.STRIPE_WEBHOOK_SECRET
       );
     } catch (err) {
-      console.error("Webhook signature error:", err.message);
+      console.error("Erreur signature webhook :", err.message);
       return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // Idempotence : ne pas retraiter un événement déjà reçu
+    if (SCHEMA.stripe_events) {
+      try {
+        const insertEvent = await pool.query(
+          `INSERT INTO stripe_events (event_id, type)
+           VALUES ($1, $2)
+           ON CONFLICT (event_id) DO NOTHING
+           RETURNING event_id`,
+          [event.id, event.type]
+        );
+
+        if (insertEvent.rows.length === 0) {
+          return res.json({ received: true, duplicate: true });
+        }
+      } catch (err) {
+        console.error("Erreur idempotence stripe_events :", err.message);
+        // On continue quand même : mieux vaut traiter que perdre l'événement.
+      }
     }
 
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
-      const commandeId = session.metadata.commande_id;
+      const commandeId = session.metadata && session.metadata.commande_id;
 
       if (commandeId) {
-        await pool.query(
-          `UPDATE commandes
-           SET statut = 'paid'
-           WHERE id = $1`,
-          [commandeId]
-        );
+        try {
+          const commandeRes = await pool.query(
+            "SELECT id, total FROM commandes WHERE id = $1",
+            [commandeId]
+          );
 
-        console.log("Commande payée :", commandeId);
+          if (commandeRes.rows.length === 0) {
+            console.error("Webhook : commande introuvable", commandeId);
+            return res.json({ received: true });
+          }
+
+          const commande = commandeRes.rows[0];
+          const attendu = Math.round(Number(commande.total) * 100);
+
+          if (session.amount_total !== attendu) {
+            console.error(
+              "Webhook : montant non concordant. Attendu",
+              attendu,
+              "reçu",
+              session.amount_total
+            );
+            return res.json({ received: true, mismatch: true });
+          }
+
+          // Construction dynamique de l'UPDATE selon les colonnes existantes
+          const sets = ["statut = 'paid'"];
+          const values = [];
+          let i = 1;
+
+          if (SCHEMA.commandes.stripe_session_id) {
+            sets.push(`stripe_session_id = $${i++}`);
+            values.push(session.id);
+          }
+
+          if (SCHEMA.commandes.stripe_payment_intent && session.payment_intent) {
+            sets.push(`stripe_payment_intent = $${i++}`);
+            values.push(session.payment_intent);
+          }
+
+          values.push(commandeId);
+
+          await pool.query(
+            `UPDATE commandes
+             SET ${sets.join(", ")}
+             WHERE id = $${i}`,
+            values
+          );
+
+          console.log("Commande payée confirmée :", commandeId);
+
+        } catch (err) {
+          console.error("Erreur traitement webhook :", err);
+          // On renvoie 200 quand même pour éviter les retries en boucle
+          // sur une erreur applicative (Stripe ré-essaie sur les non-2xx).
+          return res.json({ received: true, error: true });
+        }
       }
     }
 
@@ -60,30 +219,90 @@ app.post(
   }
 );
 
-app.use(cors());
+/* =========================================================
+   2. CORS RESTREINT
+   ========================================================= */
+
+app.use(cors({
+  origin: FRONTEND_URL,
+  credentials: true
+}));
+
 app.use(helmet());
 app.use(express.json());
+
+/* =========================================================
+   3. RATE LIMIT
+   ========================================================= */
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: "Trop de tentatives. Réessayez dans quelques minutes."
+  }
+});
+
+/* =========================================================
+   ROUTE RACINE
+   ========================================================= */
 
 app.get("/", (req, res) => {
   res.send("La Pala API fonctionne");
 });
 
+/* =========================================================
+   11. GET /api/plats (carte publique)
+   ========================================================= */
+
 app.get("/api/plats", async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM plats ORDER BY id");
+    const where = SCHEMA.plats.archive
+      ? "WHERE COALESCE(archive, false) = false"
+      : "";
+
+    const order = SCHEMA.plats.ordre
+      ? "ORDER BY COALESCE(ordre, id), id"
+      : "ORDER BY id";
+
+    const result = await pool.query(
+      `SELECT * FROM plats ${where} ${order}`
+    );
+
     res.json(result.rows);
+
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Erreur serveur" });
   }
 });
 
-app.post("/api/register", async (req, res) => {
+/* =========================================================
+   4. REGISTER (sécurisé)
+   ========================================================= */
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+app.post("/api/register", authLimiter, async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const email = String(req.body.email || "").trim().toLowerCase();
+    const password = String(req.body.password || "");
+
+    if (!EMAIL_REGEX.test(email)) {
+      return res.status(400).json({ error: "Email invalide" });
+    }
+
+    if (password.length < 8) {
+      return res.status(400).json({
+        error: "Le mot de passe doit contenir au moins 8 caractères"
+      });
+    }
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
+    // Le rôle est TOUJOURS 'client' : l'utilisateur ne peut jamais le choisir.
     const result = await pool.query(
       `INSERT INTO users (email, password, role)
        VALUES ($1, $2, 'client')
@@ -91,20 +310,30 @@ app.post("/api/register", async (req, res) => {
       [email, hashedPassword]
     );
 
-    res.json({
+    res.status(201).json({
       message: "Compte créé",
       user: result.rows[0]
     });
 
   } catch (err) {
+    // 23505 = violation de contrainte unique (email déjà utilisé)
+    if (err.code === "23505") {
+      return res.status(409).json({ error: "Cet email est déjà utilisé" });
+    }
+
     console.error(err);
     res.status(500).json({ error: "Erreur inscription" });
   }
 });
 
-app.post("/api/login", async (req, res) => {
+/* =========================================================
+   LOGIN
+   ========================================================= */
+
+app.post("/api/login", authLimiter, async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const email = String(req.body.email || "").trim().toLowerCase();
+    const password = String(req.body.password || "");
 
     const result = await pool.query(
       "SELECT id, email, password, role FROM users WHERE email = $1",
@@ -149,6 +378,10 @@ app.post("/api/login", async (req, res) => {
   }
 });
 
+/* =========================================================
+   MIDDLEWARES
+   ========================================================= */
+
 function authMiddleware(req, res, next) {
   const header = req.headers.authorization;
 
@@ -192,9 +425,7 @@ async function adminMiddleware(req, res, next) {
 
   } catch (err) {
     console.error(err);
-    res.status(500).json({
-      error: "Erreur vérification admin"
-    });
+    res.status(500).json({ error: "Erreur vérification admin" });
   }
 }
 
@@ -202,7 +433,12 @@ async function staffOrAdminMiddleware(req, res, next) {
   try {
     const role = await getUserRole(req.user.id);
 
-    if (role !== "admin" && role !== "staff" && role !== "employee" && role !== "employe") {
+    if (
+      role !== "admin" &&
+      role !== "staff" &&
+      role !== "employee" &&
+      role !== "employe"
+    ) {
       return res.status(403).json({
         error: "Accès réservé au personnel"
       });
@@ -213,66 +449,185 @@ async function staffOrAdminMiddleware(req, res, next) {
 
   } catch (err) {
     console.error(err);
-    res.status(500).json({
-      error: "Erreur vérification personnel"
-    });
+    res.status(500).json({ error: "Erreur vérification personnel" });
   }
 }
 
-app.post("/api/commandes", authMiddleware, async (req, res) => {
-  try {
-    const {
-      nom,
-      email,
-      total,
-      mode = "livraison",
-      adresse = "",
-      items = []
-    } = req.body;
+/* =========================================================
+   5. CRÉATION DE COMMANDE (prix recalculés côté serveur)
+   ========================================================= */
 
-    const commandeResult = await pool.query(
-      `INSERT INTO commandes
-      (user_id, nom, email, total, mode, adresse, statut)
-      VALUES ($1, $2, $3, $4, $5, $6, 'pending')
-      RETURNING *`,
-      [
-        req.user.id,
-        nom,
-        email,
-        total,
-        mode,
-        adresse
-      ]
+app.post("/api/commandes", authMiddleware, async (req, res) => {
+  const {
+    nom,
+    email,
+    mode = "livraison",
+    adresse = "",
+    items = []
+  } = req.body;
+
+  // Validations de base
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: "Panier vide" });
+  }
+
+  if (mode !== "livraison" && mode !== "retrait") {
+    return res.status(400).json({ error: "Mode de commande invalide" });
+  }
+
+  if (mode === "livraison" && String(adresse).trim() === "") {
+    return res.status(400).json({
+      error: "Adresse de livraison obligatoire"
+    });
+  }
+
+  // Nettoyage des items : on ne garde que plat_id + quantite valides
+  const lignes = [];
+
+  for (const item of items) {
+    const platId = Number(item.plat_id);
+    const quantite = Number(item.quantite);
+
+    if (!Number.isInteger(platId) || platId <= 0) {
+      return res.status(400).json({ error: "Plat invalide dans le panier" });
+    }
+
+    if (!Number.isInteger(quantite) || quantite <= 0 || quantite > 99) {
+      return res.status(400).json({ error: "Quantité invalide" });
+    }
+
+    lignes.push({ platId, quantite });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    // Récupération des plats réels en base
+    const platIds = lignes.map(l => l.platId);
+
+    const platsRes = await client.query(
+      "SELECT * FROM plats WHERE id = ANY($1)",
+      [platIds]
+    );
+
+    const platsMap = {};
+    platsRes.rows.forEach(p => { platsMap[p.id] = p; });
+
+    let sousTotal = 0;
+
+    for (const ligne of lignes) {
+      const plat = platsMap[ligne.platId];
+
+      if (!plat) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: `Plat #${ligne.platId} introuvable`
+        });
+      }
+
+      // Refus si archivé ou indisponible (colonnes optionnelles)
+      if (plat.archive === true) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: `Le plat "${plat.nom}" n'est plus disponible`
+        });
+      }
+
+      if (plat.disponible === false) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: `Le plat "${plat.nom}" est actuellement épuisé`
+        });
+      }
+
+      sousTotal += Number(plat.prix) * ligne.quantite;
+    }
+
+    // Frais de livraison (table optionnelle restaurant_settings)
+    let fraisLivraison = 0;
+
+    if (mode === "livraison" && SCHEMA.restaurant_settings) {
+      try {
+        const settingsRes = await client.query(
+          `SELECT valeur
+           FROM restaurant_settings
+           WHERE cle = 'frais_livraison'
+           LIMIT 1`
+        );
+
+        if (settingsRes.rows.length > 0) {
+          fraisLivraison = Number(settingsRes.rows[0].valeur) || 0;
+        }
+      } catch (err) {
+        console.error("Lecture frais_livraison impossible :", err.message);
+      }
+    }
+
+    const total = sousTotal + fraisLivraison;
+
+    // Email/nom : on privilégie le token pour éviter l'usurpation
+    const emailFinal = req.user.email || email || "";
+    const nomFinal = nom || (emailFinal ? emailFinal.split("@")[0] : "Client");
+
+    // Construction dynamique de l'INSERT selon les colonnes existantes
+    const cols = ["user_id", "nom", "email", "total", "mode", "adresse", "statut"];
+    const values = [req.user.id, nomFinal, emailFinal, total, mode, adresse, "pending"];
+
+    if (SCHEMA.commandes.sous_total) {
+      cols.push("sous_total");
+      values.push(sousTotal);
+    }
+
+    if (SCHEMA.commandes.frais_livraison) {
+      cols.push("frais_livraison");
+      values.push(fraisLivraison);
+    }
+
+    const placeholders = values.map((_, idx) => `$${idx + 1}`).join(", ");
+
+    const commandeResult = await client.query(
+      `INSERT INTO commandes (${cols.join(", ")})
+       VALUES (${placeholders})
+       RETURNING *`,
+      values
     );
 
     const commande = commandeResult.rows[0];
 
-    for (const item of items) {
-      await pool.query(
+    // Insertion des lignes avec le prix RÉEL en base
+    for (const ligne of lignes) {
+      const plat = platsMap[ligne.platId];
+
+      await client.query(
         `INSERT INTO commande_items
-        (commande_id, plat_id, quantite, prix_unitaire)
-        VALUES ($1, $2, $3, $4)`,
-        [
-          commande.id,
-          item.plat_id,
-          item.quantite,
-          item.prix_unitaire
-        ]
+         (commande_id, plat_id, quantite, prix_unitaire)
+         VALUES ($1, $2, $3, $4)`,
+        [commande.id, ligne.platId, ligne.quantite, plat.prix]
       );
     }
 
-    res.json({
+    await client.query("COMMIT");
+
+    res.status(201).json({
       success: true,
       commande
     });
 
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error(err);
-    res.status(500).json({
-      error: "Erreur commande"
-    });
+    res.status(500).json({ error: "Erreur commande" });
+
+  } finally {
+    client.release();
   }
 });
+
+/* =========================================================
+   HISTORIQUE CLIENT
+   ========================================================= */
 
 app.get("/api/mes-commandes", authMiddleware, async (req, res) => {
   try {
@@ -288,20 +643,48 @@ app.get("/api/mes-commandes", authMiddleware, async (req, res) => {
 
   } catch (err) {
     console.error(err);
-    res.status(500).json({
-      error: "Erreur historique commandes"
-    });
+    res.status(500).json({ error: "Erreur historique commandes" });
   }
 });
 
+/* =========================================================
+   6. CHECKOUT STRIPE (total pris en base, jamais du client)
+   ========================================================= */
+
 app.post("/api/create-checkout-session", authMiddleware, async (req, res) => {
   try {
-    const { total, commande_id } = req.body;
+    const commandeId = Number(req.body.commande_id);
 
-    if (!total || total <= 0) {
+    if (!Number.isInteger(commandeId) || commandeId <= 0) {
+      return res.status(400).json({ error: "Commande invalide" });
+    }
+
+    const commandeRes = await pool.query(
+      "SELECT * FROM commandes WHERE id = $1",
+      [commandeId]
+    );
+
+    if (commandeRes.rows.length === 0) {
+      return res.status(404).json({ error: "Commande introuvable" });
+    }
+
+    const commande = commandeRes.rows[0];
+
+    // La commande doit appartenir à l'utilisateur connecté
+    if (commande.user_id !== req.user.id) {
+      return res.status(403).json({ error: "Accès refusé" });
+    }
+
+    if (commande.statut !== "pending") {
       return res.status(400).json({
-        error: "Total invalide"
+        error: "Cette commande n'est plus en attente de paiement"
       });
+    }
+
+    const total = Number(commande.total);
+
+    if (!(total > 0)) {
+      return res.status(400).json({ error: "Total invalide" });
     }
 
     const session = await stripe.checkout.sessions.create({
@@ -312,69 +695,61 @@ app.post("/api/create-checkout-session", authMiddleware, async (req, res) => {
         {
           price_data: {
             currency: "eur",
-            product_data: {
-              name: "Commande La Pala"
-            },
-            unit_amount: Math.round(Number(total) * 100)
+            product_data: { name: `Commande La Pala #${commande.id}` },
+            unit_amount: Math.round(total * 100)
           },
           quantity: 1
         }
       ],
 
       metadata: {
-        commande_id: commande_id ? String(commande_id) : "",
+        commande_id: String(commande.id),
         user_id: String(req.user.id)
       },
 
-      success_url: "http://127.0.0.1:5501/pala.html#success",
-      cancel_url: "http://127.0.0.1:5501/pala.html#cart"
+      success_url: `${FRONTEND_URL}/#success`,
+      cancel_url: `${FRONTEND_URL}/#cart`
     });
 
-    res.json({
-      url: session.url
-    });
+    // Enregistrement du session_id si la colonne existe
+    if (SCHEMA.commandes.stripe_session_id) {
+      try {
+        await pool.query(
+          "UPDATE commandes SET stripe_session_id = $1 WHERE id = $2",
+          [session.id, commande.id]
+        );
+      } catch (err) {
+        console.error("Enregistrement stripe_session_id impossible :", err.message);
+      }
+    }
+
+    res.json({ url: session.url });
 
   } catch (err) {
     console.error(err);
-    res.status(500).json({
-      error: "Erreur Stripe"
-    });
+    res.status(500).json({ error: "Erreur Stripe" });
   }
 });
 
-app.post("/api/commande-payee", async (req, res) => {
-  try {
-    const { commande_id } = req.body;
+/* =========================================================
+   7. ROUTE /api/commande-payee DÉSACTIVÉE (410 Gone)
+   Le paiement est confirmé UNIQUEMENT par le webhook Stripe.
+   ========================================================= */
 
-    await pool.query(
-      `UPDATE commandes
-       SET statut = 'paid'
-       WHERE id = $1`,
-      [commande_id]
-    );
-
-    res.json({
-      success: true
-    });
-
-  } catch (err) {
-    console.error(err);
-
-    res.status(500).json({
-      error: "Erreur mise à jour commande"
-    });
-  }
+app.post("/api/commande-payee", (req, res) => {
+  res.status(410).json({
+    error: "Route désactivée. Paiement géré par le webhook Stripe."
+  });
 });
 
-/* =========================
-   ROUTES ADMIN
-   ========================= */
+/* =========================================================
+   ROUTES ADMIN — STATISTIQUES
+   ========================================================= */
 
 app.get("/api/admin/stats", authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const totalCommandes = await pool.query(`
-      SELECT COUNT(*)::int AS total
-      FROM commandes
+      SELECT COUNT(*)::int AS total FROM commandes
     `);
 
     const totalCA = await pool.query(`
@@ -418,13 +793,14 @@ app.get("/api/admin/stats", authMiddleware, adminMiddleware, async (req, res) =>
 
   } catch (err) {
     console.error(err);
-    res.status(500).json({
-      error: "Erreur statistiques admin"
-    });
+    res.status(500).json({ error: "Erreur statistiques admin" });
   }
 });
 
-/* Admin + staff peuvent voir les commandes */
+/* =========================================================
+   13. GET /api/admin/commandes (admin + staff)
+   ========================================================= */
+
 app.get("/api/admin/commandes", authMiddleware, staffOrAdminMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
@@ -460,13 +836,14 @@ app.get("/api/admin/commandes", authMiddleware, staffOrAdminMiddleware, async (r
 
   } catch (err) {
     console.error(err);
-    res.status(500).json({
-      error: "Erreur récupération commandes"
-    });
+    res.status(500).json({ error: "Erreur récupération commandes" });
   }
 });
 
-/* Admin + staff peuvent changer les statuts */
+/* =========================================================
+   14. PATCH /api/admin/commandes/:id/statut (admin + staff)
+   ========================================================= */
+
 app.patch("/api/admin/commandes/:id/statut", authMiddleware, staffOrAdminMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
@@ -487,9 +864,7 @@ app.patch("/api/admin/commandes/:id/statut", authMiddleware, staffOrAdminMiddlew
     ];
 
     if (!statutsAutorises.includes(statut)) {
-      return res.status(400).json({
-        error: "Statut invalide"
-      });
+      return res.status(400).json({ error: "Statut invalide" });
     }
 
     const result = await pool.query(
@@ -501,9 +876,7 @@ app.patch("/api/admin/commandes/:id/statut", authMiddleware, staffOrAdminMiddlew
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({
-        error: "Commande introuvable"
-      });
+      return res.status(404).json({ error: "Commande introuvable" });
     }
 
     res.json({
@@ -513,16 +886,17 @@ app.patch("/api/admin/commandes/:id/statut", authMiddleware, staffOrAdminMiddlew
 
   } catch (err) {
     console.error(err);
-    res.status(500).json({
-      error: "Erreur modification statut"
-    });
+    res.status(500).json({ error: "Erreur modification statut" });
   }
 });
 
-/* Les routes plats restent réservées admin uniquement */
+/* =========================================================
+   ROUTES ADMIN — PLATS (admin uniquement)
+   ========================================================= */
+
 app.post("/api/admin/plats", authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const { nom, description, prix, categorie, image } = req.body;
+    const { nom, description, prix, categorie, image, allergenes, ordre } = req.body;
 
     if (!nom || !prix || !categorie) {
       return res.status(400).json({
@@ -530,36 +904,70 @@ app.post("/api/admin/plats", authMiddleware, adminMiddleware, async (req, res) =
       });
     }
 
+    // Construction dynamique selon les colonnes existantes
+    const cols = ["nom", "description", "prix", "categorie", "image"];
+    const values = [nom, description || "", prix, categorie, image || ""];
+
+    if (SCHEMA.plats.disponible) {
+      cols.push("disponible");
+      values.push(true);
+    }
+
+    if (SCHEMA.plats.archive) {
+      cols.push("archive");
+      values.push(false);
+    }
+
+    if (SCHEMA.plats.allergenes && allergenes !== undefined) {
+      cols.push("allergenes");
+      values.push(allergenes || "");
+    }
+
+    if (SCHEMA.plats.ordre && ordre !== undefined) {
+      cols.push("ordre");
+      values.push(Number(ordre) || 0);
+    }
+
+    const placeholders = values.map((_, idx) => `$${idx + 1}`).join(", ");
+
     const result = await pool.query(
-      `INSERT INTO plats (nom, description, prix, categorie, image)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO plats (${cols.join(", ")})
+       VALUES (${placeholders})
        RETURNING *`,
-      [
-        nom,
-        description || "",
-        prix,
-        categorie,
-        image || ""
-      ]
+      values
     );
 
-    res.json({
+    res.status(201).json({
       success: true,
       plat: result.rows[0]
     });
 
   } catch (err) {
     console.error(err);
-    res.status(500).json({
-      error: "Erreur ajout plat"
-    });
+    res.status(500).json({ error: "Erreur ajout plat" });
   }
 });
+
+/* =========================================================
+   12. PATCH /api/admin/plats/:id
+   nom, prix, categorie obligatoires.
+   Accepte aussi disponible, archive, allergenes, ordre.
+   ========================================================= */
 
 app.patch("/api/admin/plats/:id", authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
-    const { nom, description, prix, categorie, image } = req.body;
+    const {
+      nom,
+      description,
+      prix,
+      categorie,
+      image,
+      disponible,
+      archive,
+      allergenes,
+      ordre
+    } = req.body;
 
     if (!nom || !prix || !categorie) {
       return res.status(400).json({
@@ -567,24 +975,50 @@ app.patch("/api/admin/plats/:id", authMiddleware, adminMiddleware, async (req, r
       });
     }
 
+    const sets = [];
+    const values = [];
+    let i = 1;
+
+    const addSet = (col, val) => {
+      sets.push(`${col} = $${i++}`);
+      values.push(val);
+    };
+
+    addSet("nom", nom);
+    addSet("description", description || "");
+    addSet("prix", prix);
+    addSet("categorie", categorie);
+    addSet("image", image || "");
+
+    if (SCHEMA.plats.disponible && disponible !== undefined) {
+      addSet("disponible", !!disponible);
+    }
+
+    if (SCHEMA.plats.archive && archive !== undefined) {
+      addSet("archive", !!archive);
+    }
+
+    if (SCHEMA.plats.allergenes && allergenes !== undefined) {
+      addSet("allergenes", allergenes || "");
+    }
+
+    if (SCHEMA.plats.ordre && ordre !== undefined) {
+      addSet("ordre", Number(ordre) || 0);
+    }
+
+    values.push(id);
+
     const result = await pool.query(
       `UPDATE plats
-       SET nom = $1,
-           description = $2,
-           prix = $3,
-           categorie = $4,
-           image = $5
-       WHERE id = $6
+       SET ${sets.join(", ")}
+       WHERE id = $${i}
        RETURNING *`,
-      [
-        nom,
-        description || "",
-        prix,
-        categorie,
-        image || "",
-        id
-      ]
+      values
     );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Plat introuvable" });
+    }
 
     res.json({
       success: true,
@@ -593,34 +1027,71 @@ app.patch("/api/admin/plats/:id", authMiddleware, adminMiddleware, async (req, r
 
   } catch (err) {
     console.error(err);
-    res.status(500).json({
-      error: "Erreur modification plat"
-    });
+    res.status(500).json({ error: "Erreur modification plat" });
   }
 });
+
+/* =========================================================
+   10. SOFT DELETE des plats
+   On archive au lieu de supprimer pour garder l'historique.
+   Fallback en DELETE si la colonne archive n'existe pas.
+   ========================================================= */
 
 app.delete("/api/admin/plats/:id", authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
 
-    await pool.query(
-      `DELETE FROM plats
-       WHERE id = $1`,
-      [id]
-    );
+    if (SCHEMA.plats.archive) {
+      const sets = ["archive = true"];
 
-    res.json({
-      success: true
-    });
+      if (SCHEMA.plats.disponible) {
+        sets.push("disponible = false");
+      }
+
+      const result = await pool.query(
+        `UPDATE plats
+         SET ${sets.join(", ")}
+         WHERE id = $1
+         RETURNING *`,
+        [id]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: "Plat introuvable" });
+      }
+
+      return res.json({ success: true, plat: result.rows[0] });
+    }
+
+    // Fallback : suppression physique (peut échouer si référencé par une commande)
+    await pool.query("DELETE FROM plats WHERE id = $1", [id]);
+
+    res.json({ success: true });
 
   } catch (err) {
     console.error(err);
-    res.status(500).json({
-      error: "Erreur suppression plat"
-    });
+
+    // 23503 = violation de clé étrangère (plat utilisé dans une commande)
+    if (err.code === "23503") {
+      return res.status(409).json({
+        error: "Ce plat est lié à des commandes et ne peut pas être supprimé."
+      });
+    }
+
+    res.status(500).json({ error: "Erreur suppression plat" });
   }
 });
 
-app.listen(3000, () => {
-  console.log("Serveur lancé sur http://localhost:3000");
-});
+/* =========================================================
+   9. DÉMARRAGE
+   ========================================================= */
+
+const PORT = process.env.PORT || 3000;
+
+detectSchema()
+  .catch(() => { /* déjà loggé */ })
+  .finally(() => {
+    app.listen(PORT, () => {
+      console.log(`Serveur lancé sur le port ${PORT}`);
+    });
+  });
