@@ -22,7 +22,6 @@ const pool = require("./db");
    ========================================================= */
 
 const REQUIRED_ENV = [
-  "DATABASE_URL",
   "JWT_SECRET",
   "STRIPE_SECRET_KEY",
   "STRIPE_WEBHOOK_SECRET",
