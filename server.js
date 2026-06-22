@@ -130,7 +130,7 @@ app.post("/api/login", async (req, res) => {
         role: user.role || "client"
       },
       process.env.JWT_SECRET,
-      { expiresIn: "2h" }
+      { expiresIn: "8h" }
     );
 
     res.json({
@@ -166,26 +166,55 @@ function authMiddleware(req, res, next) {
   }
 }
 
+async function getUserRole(userId) {
+  const result = await pool.query(
+    "SELECT role FROM users WHERE id = $1",
+    [userId]
+  );
+
+  if (result.rows.length === 0) return null;
+
+  return result.rows[0].role;
+}
+
 async function adminMiddleware(req, res, next) {
   try {
-    const result = await pool.query(
-      "SELECT role FROM users WHERE id = $1",
-      [req.user.id]
-    );
+    const role = await getUserRole(req.user.id);
 
-    if (result.rows.length === 0 || result.rows[0].role !== "admin") {
+    if (role !== "admin") {
       return res.status(403).json({
         error: "Accès réservé à l'administrateur"
       });
     }
 
-    req.user.role = "admin";
+    req.user.role = role;
     next();
 
   } catch (err) {
     console.error(err);
     res.status(500).json({
       error: "Erreur vérification admin"
+    });
+  }
+}
+
+async function staffOrAdminMiddleware(req, res, next) {
+  try {
+    const role = await getUserRole(req.user.id);
+
+    if (role !== "admin" && role !== "staff" && role !== "employee" && role !== "employe") {
+      return res.status(403).json({
+        error: "Accès réservé au personnel"
+      });
+    }
+
+    req.user.role = role;
+    next();
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      error: "Erreur vérification personnel"
     });
   }
 }
@@ -351,7 +380,7 @@ app.get("/api/admin/stats", authMiddleware, adminMiddleware, async (req, res) =>
     const totalCA = await pool.query(`
       SELECT COALESCE(SUM(total),0)::float AS total
       FROM commandes
-      WHERE statut <> 'annulee'
+      WHERE statut NOT IN ('annulee', 'cancelled')
     `);
 
     const preparation = await pool.query(`
@@ -363,13 +392,13 @@ app.get("/api/admin/stats", authMiddleware, adminMiddleware, async (req, res) =>
     const livraison = await pool.query(`
       SELECT COUNT(*)::int AS total
       FROM commandes
-      WHERE statut = 'livraison'
+      WHERE statut IN ('livraison', 'delivery')
     `);
 
     const payees = await pool.query(`
       SELECT COUNT(*)::int AS total
       FROM commandes
-      WHERE statut IN ('paid','preparation','livraison','terminee')
+      WHERE statut IN ('paid','accepted','preparation','ready','livraison','delivery','terminee','done')
     `);
 
     const aujourdHui = await pool.query(`
@@ -395,7 +424,8 @@ app.get("/api/admin/stats", authMiddleware, adminMiddleware, async (req, res) =>
   }
 });
 
-app.get("/api/admin/commandes", authMiddleware, adminMiddleware, async (req, res) => {
+/* Admin + staff peuvent voir les commandes */
+app.get("/api/admin/commandes", authMiddleware, staffOrAdminMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT
@@ -431,12 +461,13 @@ app.get("/api/admin/commandes", authMiddleware, adminMiddleware, async (req, res
   } catch (err) {
     console.error(err);
     res.status(500).json({
-      error: "Erreur récupération commandes admin"
+      error: "Erreur récupération commandes"
     });
   }
 });
 
-app.patch("/api/admin/commandes/:id/statut", authMiddleware, adminMiddleware, async (req, res) => {
+/* Admin + staff peuvent changer les statuts */
+app.patch("/api/admin/commandes/:id/statut", authMiddleware, staffOrAdminMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
     const { statut } = req.body;
@@ -444,10 +475,15 @@ app.patch("/api/admin/commandes/:id/statut", authMiddleware, adminMiddleware, as
     const statutsAutorises = [
       "pending",
       "paid",
+      "accepted",
       "preparation",
+      "ready",
       "livraison",
+      "delivery",
       "terminee",
-      "annulee"
+      "done",
+      "annulee",
+      "cancelled"
     ];
 
     if (!statutsAutorises.includes(statut)) {
@@ -464,6 +500,12 @@ app.patch("/api/admin/commandes/:id/statut", authMiddleware, adminMiddleware, as
       [statut, id]
     );
 
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        error: "Commande introuvable"
+      });
+    }
+
     res.json({
       success: true,
       commande: result.rows[0]
@@ -477,6 +519,7 @@ app.patch("/api/admin/commandes/:id/statut", authMiddleware, adminMiddleware, as
   }
 });
 
+/* Les routes plats restent réservées admin uniquement */
 app.post("/api/admin/plats", authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const { nom, description, prix, categorie, image } = req.body;
