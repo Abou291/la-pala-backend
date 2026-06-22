@@ -10,6 +10,12 @@ require("dotenv").config({
 });
 
 const Stripe = require("stripe");
+
+console.log(
+  "STRIPE KEY START:",
+  process.env.STRIPE_SECRET_KEY?.substring(0, 15)
+);
+
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
