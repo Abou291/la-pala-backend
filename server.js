@@ -15,6 +15,14 @@ const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
 const Stripe = require("stripe");
 
+// Email optionnel : on require sans casser si le module manque.
+let nodemailer = null;
+try {
+  nodemailer = require("nodemailer");
+} catch {
+  console.warn("Module nodemailer absent : emails désactivés.");
+}
+
 const pool = require("./db");
 
 /* =========================================================
@@ -58,9 +66,12 @@ const SCHEMA = {
     archive: false,
     disponible: false,
     ordre: false,
-    allergenes: false
+    allergenes: false,
+    ingredients: false
   },
   commandes: {
+    prenom: false,
+    telephone: false,
     sous_total: false,
     frais_livraison: false,
     stripe_session_id: false,
@@ -103,6 +114,213 @@ async function detectSchema() {
       "Détection du schéma impossible, mode minimal activé :",
       err.message
     );
+  }
+}
+
+/* =========================================================
+   RÉGLAGES RESTAURANT (lecture restaurant_settings)
+   Retourne un objet { cle: valeur } ; {} si table absente.
+   ========================================================= */
+
+async function getSettings(executor = pool) {
+  if (!SCHEMA.restaurant_settings) return {};
+
+  try {
+    const res = await executor.query(
+      "SELECT cle, valeur FROM restaurant_settings"
+    );
+
+    const settings = {};
+    res.rows.forEach(({ cle, valeur }) => {
+      settings[cle] = valeur;
+    });
+    return settings;
+
+  } catch (err) {
+    console.error("Lecture restaurant_settings impossible :", err.message);
+    return {};
+  }
+}
+
+/* =========================================================
+   HORAIRES : "HH:MM" -> minutes depuis minuit
+   ========================================================= */
+
+function parseHeureEnMinutes(str) {
+  if (!str) return null;
+  const m = String(str).trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+
+  if (h < 0 || h > 23 || min < 0 || min > 59) return null;
+  return h * 60 + min;
+}
+
+/**
+ * Vrai si l'heure de Paris est dans le créneau [ouverture, fermeture].
+ * Gère le passage après minuit (ex : 18:00 -> 01:00).
+ * Si une borne est absente/invalide : on NE bloque PAS (retourne true).
+ */
+function estDansHoraires(ouverture, fermeture) {
+  const open = parseHeureEnMinutes(ouverture);
+  const close = parseHeureEnMinutes(fermeture);
+
+  if (open == null || close == null) return true;
+
+  // Heure courante côté Europe/Paris, indépendante du fuseau du serveur.
+  const maintenant = new Date(
+    new Date().toLocaleString("en-US", { timeZone: "Europe/Paris" })
+  );
+  const minutes = maintenant.getHours() * 60 + maintenant.getMinutes();
+
+  if (open === close) return true; // 24h/24
+
+  if (open < close) {
+    return minutes >= open && minutes <= close;
+  }
+
+  // Créneau qui chevauche minuit
+  return minutes >= open || minutes <= close;
+}
+
+/* =========================================================
+   EMAIL DE CONFIRMATION (optionnel, ne casse jamais)
+   ========================================================= */
+
+const MAIL_ENV = ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS"];
+const mailConfigured =
+  nodemailer && MAIL_ENV.every(k => process.env[k]);
+
+let transporter = null;
+
+if (mailConfigured) {
+  try {
+    transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT) || 587,
+      secure: Number(process.env.SMTP_PORT) === 465,
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS
+      }
+    });
+    console.log("Email configuré (SMTP prêt).");
+  } catch (err) {
+    console.error("Init SMTP impossible :", err.message);
+    transporter = null;
+  }
+} else {
+  console.log("Email non configuré : aucun mail de confirmation ne sera envoyé.");
+}
+
+function euroMail(n) {
+  return Number(n || 0).toFixed(2).replace(".", ",") + " €";
+}
+
+function escapeMail(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+async function sendOrderConfirmationEmail(commandeId) {
+  if (!transporter) {
+    console.log("Email non configuré : envoi ignoré pour la commande", commandeId);
+    return;
+  }
+
+  try {
+    const cmdRes = await pool.query(
+      "SELECT * FROM commandes WHERE id = $1",
+      [commandeId]
+    );
+
+    if (cmdRes.rows.length === 0) {
+      console.error("Email : commande introuvable", commandeId);
+      return;
+    }
+
+    const c = cmdRes.rows[0];
+
+    if (!c.email) {
+      console.log("Email : aucune adresse pour la commande", commandeId);
+      return;
+    }
+
+    const itemsRes = await pool.query(
+      `SELECT ci.quantite, ci.prix_unitaire, p.nom AS nom_plat
+       FROM commande_items ci
+       LEFT JOIN plats p ON p.id = ci.plat_id
+       WHERE ci.commande_id = $1`,
+      [commandeId]
+    );
+
+    const lignes = itemsRes.rows.map(it => `
+      <tr>
+        <td style="padding:6px 0;">
+          ${escapeMail(it.quantite)} × ${escapeMail(it.nom_plat || "Plat")}
+        </td>
+        <td style="padding:6px 0; text-align:right;">
+          ${euroMail(Number(it.prix_unitaire) * Number(it.quantite))}
+        </td>
+      </tr>
+    `).join("");
+
+    const sousTotal = c.sous_total != null
+      ? Number(c.sous_total)
+      : Number(c.total) - Number(c.frais_livraison || 0);
+
+    const adresseBloc = (c.mode === "livraison")
+      ? `<p><strong>Adresse :</strong> ${escapeMail(c.adresse || "")}</p>`
+      : `<p><strong>Retrait au restaurant</strong></p>`;
+
+    const html = `
+      <div style="font-family:Georgia,serif;max-width:560px;margin:auto;color:#241710;">
+        <h2 style="color:#8c1a1f;">La Pala — Confirmation de commande</h2>
+        <p>Bonjour ${escapeMail(c.prenom || c.nom || "")},</p>
+        <p>Votre paiement a bien été reçu. Voici le récapitulatif :</p>
+
+        <p>
+          <strong>Commande n° ${escapeMail(c.id)}</strong><br>
+          Nom : ${escapeMail(c.prenom || "")} ${escapeMail(c.nom || "")}<br>
+          Email : ${escapeMail(c.email)}<br>
+          Téléphone : ${escapeMail(c.telephone || "Non renseigné")}<br>
+          Mode : ${escapeMail(c.mode || "livraison")}
+        </p>
+
+        ${adresseBloc}
+
+        <table style="width:100%;border-collapse:collapse;border-top:1px solid #ccc;border-bottom:1px solid #ccc;margin:16px 0;">
+          ${lignes}
+        </table>
+
+        <p style="text-align:right;">
+          Sous-total : ${euroMail(sousTotal)}<br>
+          Frais de livraison : ${euroMail(c.frais_livraison || 0)}<br>
+          <strong style="font-size:1.1em;">Total : ${euroMail(c.total)}</strong>
+        </p>
+
+        <p style="color:#2f8f46;"><strong>Statut : Payé ✅</strong></p>
+        <p style="font-size:.9em;color:#666;">Merci pour votre commande. À bientôt chez La Pala.</p>
+      </div>
+    `;
+
+    await transporter.sendMail({
+      from: process.env.MAIL_FROM || process.env.SMTP_USER,
+      to: c.email,
+      subject: `La Pala — Commande n°${c.id} confirmée`,
+      html
+    });
+
+    console.log("Email de confirmation envoyé pour la commande", commandeId);
+
+  } catch (err) {
+    // Ne JAMAIS casser le webhook à cause de l'email.
+    console.error("Erreur envoi email confirmation :", err.message);
   }
 }
 
@@ -205,6 +423,10 @@ app.post(
 
           console.log("Commande payée confirmée :", commandeId);
 
+          // Email de confirmation UNIQUEMENT après passage en 'paid'.
+          // Non bloquant : on n'attend pas pour répondre à Stripe.
+          sendOrderConfirmationEmail(commandeId);
+
         } catch (err) {
           console.error("Erreur traitement webhook :", err);
           // On renvoie 200 quand même pour éviter les retries en boucle
@@ -244,6 +466,17 @@ const authLimiter = rateLimit({
   }
 });
 
+// Limiteur sur les routes de commande / paiement (Lot 5)
+const orderLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: "Trop de requêtes. Réessayez dans quelques minutes."
+  }
+});
+
 /* =========================================================
    ROUTE RACINE
    ========================================================= */
@@ -254,6 +487,7 @@ app.get("/", (req, res) => {
 
 /* =========================================================
    11. GET /api/plats (carte publique)
+   Renvoie SELECT * : ingredients/allergenes inclus si présents.
    ========================================================= */
 
 app.get("/api/plats", async (req, res) => {
@@ -283,6 +517,9 @@ app.get("/api/plats", async (req, res) => {
    ========================================================= */
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// Téléphone FR : 06/07, 01-09, +33...
+const PHONE_FR_REGEX = /^(?:(?:\+|00)33[\s.-]?|0)[1-9](?:[\s.-]?\d{2}){4}$/;
 
 app.post("/api/register", authLimiter, async (req, res) => {
   try {
@@ -456,10 +693,11 @@ async function staffOrAdminMiddleware(req, res, next) {
    5. CRÉATION DE COMMANDE (prix recalculés côté serveur)
    ========================================================= */
 
-app.post("/api/commandes", authMiddleware, async (req, res) => {
+app.post("/api/commandes", orderLimiter, authMiddleware, async (req, res) => {
   const {
+    prenom,
     nom,
-    email,
+    telephone,
     mode = "livraison",
     adresse = "",
     items = []
@@ -472,6 +710,23 @@ app.post("/api/commandes", authMiddleware, async (req, res) => {
 
   if (mode !== "livraison" && mode !== "retrait") {
     return res.status(400).json({ error: "Mode de commande invalide" });
+  }
+
+  // Validation infos client (Lot 1)
+  const prenomClean = String(prenom || "").trim();
+  const nomClean = String(nom || "").trim();
+  const telClean = String(telephone || "").trim();
+
+  if (prenomClean.length < 2) {
+    return res.status(400).json({ error: "Prénom obligatoire" });
+  }
+
+  if (nomClean.length < 2) {
+    return res.status(400).json({ error: "Nom obligatoire" });
+  }
+
+  if (!PHONE_FR_REGEX.test(telClean)) {
+    return res.status(400).json({ error: "Numéro de téléphone invalide" });
   }
 
   if (mode === "livraison" && String(adresse).trim() === "") {
@@ -496,6 +751,18 @@ app.post("/api/commandes", authMiddleware, async (req, res) => {
     }
 
     lignes.push({ platId, quantite });
+  }
+
+  // Réglages restaurant (horaires, minimum, frais) — Lot 6
+  const settings = await getSettings();
+
+  // Blocage horaires (uniquement si les deux bornes sont définies)
+  if (settings.horaire_ouverture && settings.horaire_fermeture) {
+    if (!estDansHoraires(settings.horaire_ouverture, settings.horaire_fermeture)) {
+      return res.status(400).json({
+        error: `Commandes possibles uniquement entre ${settings.horaire_ouverture} et ${settings.horaire_fermeture}.`
+      });
+    }
   }
 
   const client = await pool.connect();
@@ -544,35 +811,42 @@ app.post("/api/commandes", authMiddleware, async (req, res) => {
       sousTotal += Number(plat.prix) * ligne.quantite;
     }
 
-    // Frais de livraison (table optionnelle restaurant_settings)
+    // Minimum de commande en livraison (Lot 6)
+    if (mode === "livraison" && settings.commande_min != null) {
+      const minimum = Number(settings.commande_min);
+      if (minimum > 0 && sousTotal < minimum) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: `Minimum de commande en livraison : ${minimum.toFixed(2).replace(".", ",")} €`
+        });
+      }
+    }
+
+    // Frais de livraison (depuis restaurant_settings)
     let fraisLivraison = 0;
 
-    if (mode === "livraison" && SCHEMA.restaurant_settings) {
-      try {
-        const settingsRes = await client.query(
-          `SELECT valeur
-           FROM restaurant_settings
-           WHERE cle = 'frais_livraison'
-           LIMIT 1`
-        );
-
-        if (settingsRes.rows.length > 0) {
-          fraisLivraison = Number(settingsRes.rows[0].valeur) || 0;
-        }
-      } catch (err) {
-        console.error("Lecture frais_livraison impossible :", err.message);
-      }
+    if (mode === "livraison" && settings.frais_livraison != null) {
+      fraisLivraison = Number(settings.frais_livraison) || 0;
     }
 
     const total = sousTotal + fraisLivraison;
 
     // Email/nom : on privilégie le token pour éviter l'usurpation
-    const emailFinal = req.user.email || email || "";
-    const nomFinal = nom || (emailFinal ? emailFinal.split("@")[0] : "Client");
+    const emailFinal = req.user.email || "";
 
     // Construction dynamique de l'INSERT selon les colonnes existantes
     const cols = ["user_id", "nom", "email", "total", "mode", "adresse", "statut"];
-    const values = [req.user.id, nomFinal, emailFinal, total, mode, adresse, "pending"];
+    const values = [req.user.id, nomClean, emailFinal, total, mode, adresse, "pending"];
+
+    if (SCHEMA.commandes.prenom) {
+      cols.push("prenom");
+      values.push(prenomClean);
+    }
+
+    if (SCHEMA.commandes.telephone) {
+      cols.push("telephone");
+      values.push(telClean);
+    }
 
     if (SCHEMA.commandes.sous_total) {
       cols.push("sous_total");
@@ -625,20 +899,53 @@ app.post("/api/commandes", authMiddleware, async (req, res) => {
 });
 
 /* =========================================================
-   HISTORIQUE CLIENT
+   HISTORIQUE CLIENT (détaillé, avec items) — Lot 2
    ========================================================= */
 
 app.get("/api/mes-commandes", authMiddleware, async (req, res) => {
   try {
-    const commandesResult = await pool.query(
-      `SELECT *
-       FROM commandes
-       WHERE user_id = $1
-       ORDER BY date_commande DESC`,
+    // Colonnes optionnelles ajoutées seulement si présentes
+    const extraCols = [];
+    if (SCHEMA.commandes.prenom)          extraCols.push("c.prenom");
+    if (SCHEMA.commandes.telephone)       extraCols.push("c.telephone");
+    if (SCHEMA.commandes.sous_total)      extraCols.push("c.sous_total");
+    if (SCHEMA.commandes.frais_livraison) extraCols.push("c.frais_livraison");
+
+    const extraSelect = extraCols.length ? extraCols.join(",\n        ") + "," : "";
+
+    const result = await pool.query(
+      `SELECT
+        c.id,
+        c.user_id,
+        c.nom,
+        c.email,
+        c.total,
+        c.mode,
+        c.adresse,
+        c.statut,
+        c.date_commande,
+        ${extraSelect}
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'plat_id', ci.plat_id,
+              'quantite', ci.quantite,
+              'prix_unitaire', ci.prix_unitaire,
+              'nom_plat', p.nom
+            )
+          ) FILTER (WHERE ci.id IS NOT NULL),
+          '[]'
+        ) AS items
+      FROM commandes c
+      LEFT JOIN commande_items ci ON ci.commande_id = c.id
+      LEFT JOIN plats p ON p.id = ci.plat_id
+      WHERE c.user_id = $1
+      GROUP BY c.id
+      ORDER BY c.date_commande DESC`,
       [req.user.id]
     );
 
-    res.json(commandesResult.rows);
+    res.json(result.rows);
 
   } catch (err) {
     console.error(err);
@@ -650,7 +957,7 @@ app.get("/api/mes-commandes", authMiddleware, async (req, res) => {
    6. CHECKOUT STRIPE (total pris en base, jamais du client)
    ========================================================= */
 
-app.post("/api/create-checkout-session", authMiddleware, async (req, res) => {
+app.post("/api/create-checkout-session", orderLimiter, authMiddleware, async (req, res) => {
   try {
     const commandeId = Number(req.body.commande_id);
 
@@ -742,6 +1049,29 @@ app.post("/api/commande-payee", (req, res) => {
 });
 
 /* =========================================================
+   PARAMÈTRES PUBLICS (frais, minimum, horaires)
+   Sert au frontend pour afficher l'estimation panier.
+   ========================================================= */
+
+app.get("/api/settings-public", async (req, res) => {
+  try {
+    const settings = await getSettings();
+
+    res.json({
+      frais_livraison: settings.frais_livraison ?? null,
+      commande_min: settings.commande_min ?? null,
+      horaire_ouverture: settings.horaire_ouverture ?? null,
+      horaire_fermeture: settings.horaire_fermeture ?? null,
+      zone_livraison: settings.zone_livraison ?? null
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.json({});
+  }
+});
+
+/* =========================================================
    ROUTES ADMIN — STATISTIQUES
    ========================================================= */
 
@@ -802,6 +1132,12 @@ app.get("/api/admin/stats", authMiddleware, adminMiddleware, async (req, res) =>
 
 app.get("/api/admin/commandes", authMiddleware, staffOrAdminMiddleware, async (req, res) => {
   try {
+    const extraCols = [];
+    if (SCHEMA.commandes.prenom)    extraCols.push("c.prenom");
+    if (SCHEMA.commandes.telephone) extraCols.push("c.telephone");
+
+    const extraSelect = extraCols.length ? extraCols.join(",\n        ") + "," : "";
+
     const result = await pool.query(
       `SELECT
         c.id,
@@ -813,6 +1149,7 @@ app.get("/api/admin/commandes", authMiddleware, staffOrAdminMiddleware, async (r
         c.adresse,
         c.statut,
         c.date_commande,
+        ${extraSelect}
         COALESCE(
           json_agg(
             json_build_object(
@@ -895,7 +1232,17 @@ app.patch("/api/admin/commandes/:id/statut", authMiddleware, staffOrAdminMiddlew
 
 app.post("/api/admin/plats", authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const { nom, description, prix, categorie, image, allergenes, ordre } = req.body;
+    const {
+      nom,
+      description,
+      prix,
+      categorie,
+      image,
+      ingredients,
+      allergenes,
+      disponible,
+      ordre
+    } = req.body;
 
     if (!nom || !prix || !categorie) {
       return res.status(400).json({
@@ -907,9 +1254,19 @@ app.post("/api/admin/plats", authMiddleware, adminMiddleware, async (req, res) =
     const cols = ["nom", "description", "prix", "categorie", "image"];
     const values = [nom, description || "", prix, categorie, image || ""];
 
+    if (SCHEMA.plats.ingredients) {
+      cols.push("ingredients");
+      values.push(ingredients || "");
+    }
+
+    if (SCHEMA.plats.allergenes) {
+      cols.push("allergenes");
+      values.push(allergenes || "");
+    }
+
     if (SCHEMA.plats.disponible) {
       cols.push("disponible");
-      values.push(true);
+      values.push(disponible === undefined ? true : !!disponible);
     }
 
     if (SCHEMA.plats.archive) {
@@ -917,12 +1274,7 @@ app.post("/api/admin/plats", authMiddleware, adminMiddleware, async (req, res) =
       values.push(false);
     }
 
-    if (SCHEMA.plats.allergenes && allergenes !== undefined) {
-      cols.push("allergenes");
-      values.push(allergenes || "");
-    }
-
-    if (SCHEMA.plats.ordre && ordre !== undefined) {
+    if (SCHEMA.plats.ordre) {
       cols.push("ordre");
       values.push(Number(ordre) || 0);
     }
@@ -950,7 +1302,7 @@ app.post("/api/admin/plats", authMiddleware, adminMiddleware, async (req, res) =
 /* =========================================================
    12. PATCH /api/admin/plats/:id
    nom, prix, categorie obligatoires.
-   Accepte aussi disponible, archive, allergenes, ordre.
+   Accepte aussi ingredients, allergenes, disponible, archive, ordre.
    ========================================================= */
 
 app.patch("/api/admin/plats/:id", authMiddleware, adminMiddleware, async (req, res) => {
@@ -962,9 +1314,10 @@ app.patch("/api/admin/plats/:id", authMiddleware, adminMiddleware, async (req, r
       prix,
       categorie,
       image,
+      ingredients,
+      allergenes,
       disponible,
       archive,
-      allergenes,
       ordre
     } = req.body;
 
@@ -989,16 +1342,20 @@ app.patch("/api/admin/plats/:id", authMiddleware, adminMiddleware, async (req, r
     addSet("categorie", categorie);
     addSet("image", image || "");
 
+    if (SCHEMA.plats.ingredients && ingredients !== undefined) {
+      addSet("ingredients", ingredients || "");
+    }
+
+    if (SCHEMA.plats.allergenes && allergenes !== undefined) {
+      addSet("allergenes", allergenes || "");
+    }
+
     if (SCHEMA.plats.disponible && disponible !== undefined) {
       addSet("disponible", !!disponible);
     }
 
     if (SCHEMA.plats.archive && archive !== undefined) {
       addSet("archive", !!archive);
-    }
-
-    if (SCHEMA.plats.allergenes && allergenes !== undefined) {
-      addSet("allergenes", allergenes || "");
     }
 
     if (SCHEMA.plats.ordre && ordre !== undefined) {
